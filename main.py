@@ -4,6 +4,7 @@ Procesa imágenes y PDFs de tickets y devuelve datos estructurados listos para S
 """
 
 import base64
+from database import init_db, save_receipt_to_db
 import logging
 import os
 import sys
@@ -15,6 +16,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from models import ReceiptData
+from database import init_db, save_receipt_to_db
 
 # Cargar .env al inicio para que SAVE_RENDERED_IMAGE y OPENAI_API_KEY estén disponibles
 dotenv.load_dotenv()
@@ -129,35 +131,20 @@ def pdf_first_page_to_base64(pdf_path: str | Path, save_rendered_to: str | Path 
         doc.close()
 
 
-def load_file_to_base64(file_path: str | Path) -> tuple[str, str]:
-    """
-    Carga un archivo (imagen o PDF) y devuelve (base64, media_type).
-    Para PDFs convierte la primera página a PNG de alta calidad.
-    """
+def load_file_content(file_path: str | Path) -> tuple[str, str]:
+    """Devuelve (contenido, tipo) donde contenido es base64 o texto plano."""
     path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"No existe el archivo: {path}")
-
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError(
-            f"Formato no soportado: {suffix}. "
-            f"Soportados: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
-        )
 
-    if suffix in SUPPORTED_PDF_EXTENSIONS:
-        logger.info("Procesando PDF: %s", path.name)
-        save_to = None
-        if os.getenv("SAVE_RENDERED_IMAGE"):
-            # Guardar junto al PDF con ruta absoluta para que sepas dónde está
-            save_to = path.resolve().with_name(path.stem + "_rendered.png")
-        b64 = pdf_first_page_to_base64(path, save_rendered_to=save_to)
-        return b64, "image/png"
+    if suffix == ".pdf":
+        # EXTRACCIÓN DIRECTA DE TEXTO (Mucho más preciso para tickets digitales)
+        doc = fitz.open(path)
+        text = chr(12).join([page.get_text() for page in doc])
+        doc.close()
+        return text, "text/plain"
     
-    logger.info("Procesando imagen: %s", path.name)
-    b64 = encode_image_to_base64(path)
-    return b64, get_media_type(path)
-
+    # Si es imagen, sigue con base64
+    return encode_image_to_base64(path), get_media_type(path)
 
 def get_media_type(path: str | Path) -> str:
     """Devuelve el media type para la API según la extensión."""
@@ -175,112 +162,86 @@ SYSTEM_PROMPT = """
 ### ROLE: SENIOR_RETAIL_DATA_EXTRACTOR (ARGENTINA)
 
 ### MISSION:
-Convertir una imagen de ticket de consumo (supermercado/retail) en un objeto JSON estructurado con precisión contable.
-
-### OBLIGATORIO - items NO puede quedar vacío:
-- En `items` debes incluir TODAS las líneas de productos que aparecen en el ticket.
-- Cada fila que tenga descripción de producto + cantidad + precio (o total de línea) es un ítem.
-- Si el ticket tiene productos impresos, la lista `items` debe tener al menos un ítem por cada producto. No devuelvas `items: []` si hay líneas de productos visibles.
+Convertir los datos de un ticket de consumo en un objeto JSON estructurado con precisión contable.
 
 ### EXTRACTION & NORMALIZATION RULES:
 1.  **PRODUCT_NORMALIZATION (CRITICAL):**
-    - No copies el texto críptico del ticket (ej: "LECH.LS.DS.1L").
-    - Expande y normaliza a nombres humanos legibles (ej: "Leche La Serenísima Descremada 1L").
-    - Identifica y separa la Marca y la Presentación (litros, gramos, unidades).
+    - No copies el texto críptico (ej: "LECH.LS.DS.1L"). 
+    - Normaliza a nombres legibles (ej: "Leche La Serenísima Descremada 1L").
+    - Identifica y separa la Marca y la Presentación.
 
 2.  **FINANCIAL_INTEGRITY:**
-    - `unit_price`: Precio NETO por unidad después de descuentos. Si hay precio base y descuento: (Precio_Base - Descuento) / Cantidad.
-    - `total_line_price`: estrictamente `quantity * unit_price`.
-    - Ignora ítems informativos con valor 0 o leyendas (ej: "Usted ahorró...").
+    - `unit_price`: Debe ser el precio NETO pagado por unidad después de descuentos. 
+    - `total_line_price`: Debe ser estrictamente `quantity * unit_price`.
+    - Ignora ítems con valor 0 o leyendas informativas.
 
 3.  **DISCOUNT_LOGIC:**
-    - Si hay descuento general al final (ej: "Promo Banco 10%"), distribuye proporcionalmente en `unit_price` para que la suma de ítems coincida con `total_amount`.
+    - Si hay un descuento general al final (ej: "10% dto-MAYOR 60"), aplícalo proporcionalmente al `unit_price` de cada producto para que la suma de `total_line_price` coincida con el `total_amount`.
 
-4.  **METADATA:**
-    - `date`: Formato ISO (YYYY-MM-DD). Si hay fecha en el ticket, extraerla siempre. Si no hay, usar string vacío "" (nunca "null").
-    - `store_name`: Nombre comercial conocido (ej: "Coto", "Carrefour").
-    - `total_amount`: Debe ser el monto total que figura en el ticket. Si el ticket muestra un total, no devolver 0.
-    - `cuit`: Solo números si aparece.
+4.  **METADATA (store_name MUY IMPORTANTE):**
+    - `date`: Formato ISO (YYYY-MM-DD).
+    - `store_name`: Debe ser el **nombre de la cadena/comercio**, no la sucursal ni el barrio.
+        - Si aparece algo como "Carrefour Olivos", usar `"Carrefour"`.
+        - Prioriza palabras junto al logo o en la cabecera como marca principal.
+        - Nunca uses solo el nombre de la localidad (ej: "Olivos", "San Isidro") como `store_name`.
+    - `cuit`: Solo números.
 
 ### BEHAVIORAL CONSTRAINTS:
-- No inventar datos. Solo extraer lo que está escrito.
-- Completitud: rellenar todos los campos del esquema para los que el ticket tenga información (items, total_amount, date, store_name).
-- Formato de salida: JSON estricto según el esquema ReceiptData.
+- Si el input es texto (de un PDF), procésalo con rigor matemático.
+- Si un campo es ilegible, usa "". No inventes datos.
+- Formato de salida: JSON estricto según ReceiptData.
 """
 
 
 def parse_receipt_image(file_path: str | Path, client: OpenAI | None = None) -> ReceiptData:
-    """
-    Procesa una imagen o PDF de ticket y devuelve ReceiptData estructurado.
-    Para PDFs se usa la primera página. Usa OpenAI Structured Outputs (parse).
-    """
-    file_path = Path(file_path)
-    b64, media_type = load_file_to_base64(file_path)
+    content, media_type = load_file_content(file_path) # Usar la nueva función
+    
+    # Construir el mensaje según el tipo de contenido
+    user_content = []
+    if media_type == "text/plain":
+        user_content.append({"type": "text", "text": f"Analiza este texto de ticket:\n\n{content}"})
+    else:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{content}", "detail": "high"}
+        })
 
+    # IMPORTANTE: Para estos tickets largos, usa el modelo "grande" (gpt-4o por defecto)
+    model = os.getenv("OPENAI_RECEIPT_MODEL", "gpt-4o")
+
+    # Cliente de OpenAI (permite inyectar uno externo en tests)
     api_client = client or OpenAI(api_key=load_api_key())
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Aplica el rol SENIOR_RETAIL_DATA_EXTRACTOR: extrae store_name, date, total_amount, cuit si aplica, y en items cada línea de producto con name, quantity, unit_price y total_line_price. No dejes items vacío si hay productos; no dejes total_amount en 0 si el ticket muestra un total.",
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{b64}",
-                        "detail": "high",
-                    },
-                },
-            ],
-        },
-    ]
-
-    # Modelo: gpt-4o-mini tiene mejor visión para tickets; se puede sobreescribir con OPENAI_RECEIPT_MODEL
-    model = os.getenv("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
-
-    # Structured Outputs: beta en SDK 2026, fallback a chat.completions.parse
-    try:
-        completion = api_client.beta.chat.completions.parse(
-            model=model,
-            messages=messages,
-            response_format=ReceiptData,
-        )
-    except AttributeError:
-        completion = api_client.chat.completions.parse(
-            model=model,
-            messages=messages,
-            response_format=ReceiptData,
-        )
-
+    completion = api_client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content}
+        ],
+        response_format=ReceiptData,
+    )
     parsed: ReceiptData = completion.choices[0].message.parsed
-    if parsed is None:
-        raise ValueError("La API no devolvió datos estructurados (parsed es None)")
 
-    # Normalizar date: si el modelo devolvió la palabra "null", usar string vacío
-    if parsed.date and parsed.date.strip().lower() == "null":
-        parsed = parsed.model_copy(update={"date": ""})
-
-    # Validar que no sean valores de error del modelo
-    if parsed.store_name.startswith("ERROR_") or parsed.date.startswith("ERROR_"):
-        error_msg = (
-            f"El modelo reportó error al procesar la imagen/PDF. "
-            f"Store: {parsed.store_name}, Date: {parsed.date}. "
-            f"Posibles causas: imagen de baja calidad, PDF corrupto, o formato no reconocido."
-        )
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+    # Post-procesar store_name para preferir marca conocida sobre razón social / sucursal
+    # Usamos tanto el texto completo (si lo hay) como el store_name que devolvió el modelo.
+    try:
+        full_text = content if media_type == "text/plain" else ""
+        combined = (full_text + " " + (parsed.store_name or "")).lower()
+        known_brands = ["carrefour", "carrefour market", "jumbo", "disco", "coto"]
+        for brand in known_brands:
+            if brand in combined:
+                parsed = parsed.model_copy(update={"store_name": brand.title()})
+                break
+    except Exception:
+        # Si algo falla en el post-procesado, devolvemos lo que ya teníamos
+        pass
 
     return parsed
-
 
 def validate_totals(receipt: ReceiptData) -> None:
     """
     Valida que la suma de total_line_price coincida con total_amount
-    dentro de un margen del 1%. Imprime warning si no coincide.
+    dentro de un margen del 1%. Imprime warning si no coincide. 
     """
     items_total = sum(item.total_line_price for item in receipt.items)
     diff = abs(receipt.total_amount - items_total)
@@ -346,11 +307,20 @@ def main() -> None:
         sys.exit(1)
 
     file_path = sys.argv[1]
+
+    # 1) Inicializar BD (idempotente)
+    init_db()
+
+    # 2) Procesar ticket
     result = run_ingestion(file_path)
     if result is None:
         sys.exit(1)
 
-    # Salida estructurada (opcional: para piping o integración)
+    # 3) Guardar en BD
+    save_receipt_to_db(result)
+    print("✅ Datos guardados en superfollow.db")
+
+    # 4) Salida estructurada (opcional: para piping o integración)
     print("\n--- ReceiptData (listo para SQL) ---")
     print(result.model_dump_json(indent=2))
 

@@ -12,3 +12,7 @@ __pycache__
 .mypy_cache
 .vscode
 .idea
+rendered_images/
+*.png
+*.pdf
+*.jpg
